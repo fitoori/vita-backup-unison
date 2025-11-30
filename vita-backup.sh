@@ -251,7 +251,20 @@ maybe_reexec_in_tmux() {
             session_name="${TMUX_SESSION_PREFIX}_$(date +%Y%m%d_%H%M%S)"
             log_info "Launching tmux session '%s'..." "$session_name"
             # PSVITA_TMUX_CHILD=1 marks the child instance so we do not re-enter tmux.
-            PSVITA_TMUX_CHILD=1 exec tmux new-session -s "$session_name" "$0" "$@"
+            # Do not use exec so we can gracefully recover if tmux fails to start.
+            set +e
+            PSVITA_TMUX_CHILD=1 tmux new-session -s "$session_name" "$0" "$@"
+            local tmux_status=$?
+            set -e
+
+            if [ "$tmux_status" -ne 0 ]; then
+                log_warn "tmux session launch failed (exit %d); continuing without tmux protection." "$tmux_status"
+                return 0
+            fi
+
+            # The parent invocation should not continue once the tmux-managed
+            # child finishes. Exit cleanly to avoid running twice.
+            exit 0
             ;;
         *)
             log_warn "Proceeding without tmux. If this terminal closes, the backup will abort."
