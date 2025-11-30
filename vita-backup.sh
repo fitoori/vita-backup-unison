@@ -259,8 +259,8 @@ maybe_reexec_in_tmux() {
             set -e
 
             if [ "$tmux_status" -ne 0 ]; then
-                log_warn "tmux session launch failed (exit %d); continuing without tmux protection." "$tmux_status"
-                return 0
+                log_error "tmux session exited with status %d; aborting parent invocation." "$tmux_status"
+                exit "$tmux_status"
             fi
 
             # The parent invocation should not continue once the tmux-managed
