@@ -83,6 +83,13 @@ cleanup_on_exit() {
     local status
     status="$1"
 
+    # If running inside a tmux-managed child, persist the exit status for the parent.
+    if [ -n "${PSVITA_TMUX_STATUS_FILE:-}" ]; then
+        if ! printf '%s' "$status" >"$PSVITA_TMUX_STATUS_FILE"; then
+            log_warn "Unable to write tmux child status to %s." "$PSVITA_TMUX_STATUS_FILE"
+        fi
+    fi
+
     # Prevent recursive trap invocation if we call exit below.
     trap - EXIT INT TERM
 
@@ -249,17 +256,38 @@ maybe_reexec_in_tmux() {
         [Yy]*)
             local session_name
             session_name="${TMUX_SESSION_PREFIX}_$(date +%Y%m%d_%H%M%S)"
+            local tmux_status_file
+            tmux_status_file="$(mktemp -t psvita_tmux_status.XXXXXX)"
             log_info "Launching tmux session '%s'..." "$session_name"
             # PSVITA_TMUX_CHILD=1 marks the child instance so we do not re-enter tmux.
             # Do not use exec so we can gracefully recover if tmux fails to start.
             set +e
-            PSVITA_TMUX_CHILD=1 tmux new-session -s "$session_name" "$0" "$@"
+            PSVITA_TMUX_CHILD=1 PSVITA_TMUX_STATUS_FILE="$tmux_status_file" tmux new-session -s "$session_name" "$0" "$@"
             local tmux_status=$?
             set -e
 
             if [ "$tmux_status" -ne 0 ]; then
                 log_error "tmux session exited with status %d; aborting parent invocation." "$tmux_status"
                 exit "$tmux_status"
+            fi
+
+            local child_status
+            child_status="$tmux_status"
+            if [ -e "$tmux_status_file" ]; then
+                if read -r child_status <"$tmux_status_file"; then
+                    log_info "tmux child exited with status %s." "$child_status"
+                else
+                    log_warn "Could not read tmux child status file; using tmux exit status %d." "$tmux_status"
+                    child_status="$tmux_status"
+                fi
+                rm -f "$tmux_status_file"
+            else
+                log_warn "tmux child status file missing; using tmux exit status %d." "$tmux_status"
+            fi
+
+            if [ "$child_status" -ne 0 ]; then
+                log_error "tmux-managed backup failed with status %d; propagating to parent." "$child_status"
+                exit "$child_status"
             fi
 
             # The parent invocation should not continue once the tmux-managed
