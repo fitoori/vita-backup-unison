@@ -30,6 +30,7 @@ TMUX_SESSION_PREFIX="psvita_backup"
 # Globals
 #######################################
 
+SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 VITA_DEVICE=""
 VITA_MOUNTED=0
 BACKUP_MODE=""
