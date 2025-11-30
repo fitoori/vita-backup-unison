@@ -17,6 +17,12 @@ BACKUP_SUBDIR="vita"
 # Local mount point for the Vita USB mass storage.
 VITA_MOUNTPOINT="/mnt/psvita_vita"
 
+# VitaShell Wi-Fi SMB configuration. VitaShell exposes an SMB server on port 1337.
+# The default share name is typically the Vita storage root (ux0). Adjust if your
+# VitaShell configuration uses a different share label.
+VITA_WIFI_PORT=1337
+VITA_WIFI_SHARE="ux0"
+
 # Default tmux session name (used if we spawn one automatically).
 TMUX_SESSION_PREFIX="psvita_backup"
 
@@ -26,6 +32,9 @@ TMUX_SESSION_PREFIX="psvita_backup"
 
 VITA_DEVICE=""
 VITA_MOUNTED=0
+BACKUP_MODE=""
+VITA_WIFI_HOST=""
+WIFI_WARNING_SHOWN=0
 
 #######################################
 # Logging helpers
@@ -82,6 +91,7 @@ check_prereqs() {
     require_cmd mount
     require_cmd umount
     require_cmd mountpoint
+    require_cmd findmnt
     require_cmd find
     require_cmd du
     require_cmd df
@@ -89,6 +99,91 @@ check_prereqs() {
     require_cmd awk
     require_cmd sort
     require_cmd date
+}
+
+#######################################
+# Argument parsing
+#######################################
+
+usage() {
+    cat <<'EOF'
+Usage: vita-backup.sh [--usb | --wifi]
+
+Options:
+  --usb   Force USB backup mode (VitaShell USB mass storage).
+  --wifi  Force Wi-Fi backup mode (VitaShell SMB over Wi-Fi on port 1337).
+  -h, --help  Show this help text.
+
+If no mode is provided, you will be prompted to choose USB or Wi-Fi.
+EOF
+}
+
+set_backup_mode() {
+    local mode
+    mode="$1"
+    if [ -n "$BACKUP_MODE" ] && [ "$BACKUP_MODE" != "$mode" ]; then
+        fatal "Multiple backup modes specified; choose either --usb or --wifi."
+    fi
+    BACKUP_MODE="$mode"
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --usb)
+                set_backup_mode "usb"
+                ;;
+            --wifi)
+                set_backup_mode "wifi"
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                fatal "Unknown argument: %s" "$1"
+                ;;
+        esac
+        shift
+    done
+}
+
+warn_wifi_caveats() {
+    if [ "$WIFI_WARNING_SHOWN" -eq 1 ]; then
+        return 0
+    fi
+    log_warn "Wi-Fi backups are slower and should not be used for first-time or large-volume syncs."
+    WIFI_WARNING_SHOWN=1
+}
+
+prompt_backup_mode() {
+    if [ -n "$BACKUP_MODE" ]; then
+        return 0
+    fi
+
+    warn_wifi_caveats
+    while :; do
+        printf 'Use USB or Wi-Fi for this backup? [usb/wifi]: '
+        local answer
+        read -r answer || answer=""
+        case "${answer,,}" in
+            usb|u)
+                BACKUP_MODE="usb"
+                break
+                ;;
+            wifi|w)
+                BACKUP_MODE="wifi"
+                warn_wifi_caveats
+                break
+                ;;
+            "")
+                log_error "Please enter 'usb' or 'wifi'."
+                ;;
+            *)
+                log_error "Unrecognized selection '%s'. Please type 'usb' or 'wifi'." "$answer"
+                ;;
+        esac
+    done
 }
 
 #######################################
@@ -274,6 +369,65 @@ mount_vita_device() {
 }
 
 #######################################
+# Vita Wi-Fi SMB mount
+#######################################
+
+ensure_vita_mountpoint_available() {
+    mkdir -p "$VITA_MOUNTPOINT"
+    if mountpoint -q "$VITA_MOUNTPOINT"; then
+        fatal "Mount point '%s' is already in use." "$VITA_MOUNTPOINT"
+    fi
+}
+
+prompt_vita_wifi_endpoint() {
+    while :; do
+        printf 'Enter the PS Vita IP address shown in VitaShell (Wi-Fi SMB): '
+        local answer
+        read -r answer || answer=""
+        answer=${answer//[[:space:]]/}
+        if [ -z "$answer" ]; then
+            log_error "IP address is required to continue."
+            continue
+        fi
+        VITA_WIFI_HOST="$answer"
+        break
+    done
+
+    log_warn "Wi-Fi backups are slower and should not be attempted for first-time or large-volume syncs."
+}
+
+mount_vita_wifi_share() {
+    if [ -z "$VITA_WIFI_HOST" ]; then
+        fatal "Vita Wi-Fi host is not set."
+    fi
+
+    ensure_vita_mountpoint_available
+
+    log_info "Step 3 (Wi-Fi): Mounting Vita SMB share //%s/%s at %s via port %d..." \
+        "$VITA_WIFI_HOST" "$VITA_WIFI_SHARE" "$VITA_MOUNTPOINT" "$VITA_WIFI_PORT"
+
+    local opts_base opts success version
+    opts_base="guest,uid=$(id -u),gid=$(id -g),file_mode=0644,dir_mode=0755,port=${VITA_WIFI_PORT},nounix,noserverino"
+    success=0
+    for version in 3.0 2.1 1.0; do
+        opts="${opts_base},vers=${version}"
+        if mount -t cifs "//${VITA_WIFI_HOST}/${VITA_WIFI_SHARE}" "$VITA_MOUNTPOINT" -o "$opts"; then
+            success=1
+            log_info "Mounted Vita SMB share using SMB version %s." "$version"
+            break
+        fi
+        log_warn "Failed to mount Vita SMB share using SMB version %s; trying fallback..." "$version"
+    done
+
+    if [ "$success" -ne 1 ]; then
+        fatal "Could not mount Vita SMB share //%s/%s at %s using SMB over Wi-Fi." \
+            "$VITA_WIFI_HOST" "$VITA_WIFI_SHARE" "$VITA_MOUNTPOINT"
+    fi
+
+    VITA_MOUNTED=1
+}
+
+#######################################
 # macOS artifact cleanup
 #######################################
 
@@ -430,15 +584,25 @@ eject_vita() {
 #######################################
 
 main() {
+    parse_args "$@"
     check_prereqs
 
     # Step 4c: ensure tmux protection as early as possible.
     maybe_reexec_in_tmux "$@"
 
+    prompt_backup_mode
+    if [ "$BACKUP_MODE" = "wifi" ]; then
+        warn_wifi_caveats
+    fi
     ensure_smb_mount
 
-    select_vita_device
-    mount_vita_device
+    if [ "$BACKUP_MODE" = "wifi" ]; then
+        prompt_vita_wifi_endpoint
+        mount_vita_wifi_share
+    else
+        select_vita_device
+        mount_vita_device
+    fi
 
     # Step 4: clean macOS artifacts on both roots.
     clean_macos_cruft "$VITA_MOUNTPOINT"
@@ -473,7 +637,11 @@ main() {
         # Successful sync: eject Vita and tell user to disconnect.
         if eject_vita; then
             printf '\nBackup completed successfully.\n'
-            printf 'Step 7: You may now safely disconnect the PS Vita from USB.\n'
+            if [ "$BACKUP_MODE" = "wifi" ]; then
+                printf 'Step 7: You may now stop the VitaShell Wi-Fi SMB server or disconnect the PS Vita from Wi-Fi.\n'
+            else
+                printf 'Step 7: You may now safely disconnect the PS Vita from USB.\n'
+            fi
         else
             printf '\nBackup completed, but Vita could not be fully ejected.\n'
             printf 'Step 7: Check for open files, unmount %s manually if needed, then disconnect the PS Vita.\n' "$VITA_MOUNTPOINT"
