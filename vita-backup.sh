@@ -6,12 +6,11 @@ set -euo pipefail
 # Configuration
 #######################################
 
-# SMB share that holds the backup tree: smb://home.local/psvita_backup
-SMB_SERVER="home.local"
-SMB_SHARE="psvita_backup"
-SMB_MOUNTPOINT="/mnt/psvita_backup"
+# NFS export that holds the backup tree.
+NFS_REMOTE="home.local:/volume1/Family/sat"
+BACKUP_MOUNTPOINT="/mnt/domo/psvita-backup"
 
-# Subdirectory inside the mounted SMB share used as the Vita backup root.
+# Subdirectory inside the mounted backup share used as the Vita backup root.
 BACKUP_SUBDIR="vita"
 
 # Local mount point for the Vita USB mass storage.
@@ -30,6 +29,7 @@ TMUX_SESSION_PREFIX="psvita_backup"
 # Globals
 #######################################
 
+SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 VITA_DEVICE=""
 VITA_MOUNTED=0
 BACKUP_MODE=""
@@ -138,6 +138,7 @@ check_prereqs() {
     require_cmd awk
     require_cmd sort
     require_cmd date
+    require_cmd sudo
 }
 
 #######################################
@@ -293,6 +294,7 @@ maybe_reexec_in_tmux() {
             # The parent invocation should not continue once the tmux-managed
             # child finishes. Exit cleanly to avoid running twice.
             exit 0
+            PSVITA_TMUX_CHILD=1 exec tmux new-session -s "$session_name" "$SCRIPT_PATH" "$@"
             ;;
         *)
             log_warn "Proceeding without tmux. If this terminal closes, the backup will abort."
@@ -301,35 +303,41 @@ maybe_reexec_in_tmux() {
 }
 
 #######################################
-# SMB mount handling (Step 0)
+# NFS mount handling (Step 0)
 #######################################
 
-ensure_smb_mount() {
-    if [ -z "$SMB_SERVER" ] || [ -z "$SMB_SHARE" ] || [ -z "$SMB_MOUNTPOINT" ]; then
-        fatal "SMB configuration variables must not be empty."
+ensure_nfs_mount() {
+    if [ -z "$NFS_REMOTE" ] || [ -z "$BACKUP_MOUNTPOINT" ]; then
+        fatal "NFS configuration variables must not be empty."
     fi
 
-    mkdir -p "$SMB_MOUNTPOINT"
+    mkdir -p "$BACKUP_MOUNTPOINT"
 
-    if mountpoint -q "$SMB_MOUNTPOINT"; then
-        log_info "SMB share already mounted at %s" "$SMB_MOUNTPOINT"
-    else
-        log_info "Mounting SMB share //%s/%s at %s..." "$SMB_SERVER" "$SMB_SHARE" "$SMB_MOUNTPOINT"
-        # Use guest access by default; adjust if your share requires credentials.
-        # You can change options here if needed (no placeholders in default config).
-        local opts
-        opts="guest,vers=3.0,uid=$(id -u),gid=$(id -g),file_mode=0644,dir_mode=0755"
-        if ! mount -t cifs "//${SMB_SERVER}/${SMB_SHARE}" "$SMB_MOUNTPOINT" -o "$opts"; then
-            fatal "Failed to mount SMB share //${SMB_SERVER}/${SMB_SHARE} at ${SMB_MOUNTPOINT}."
+    if mountpoint -q "$BACKUP_MOUNTPOINT"; then
+        local current_source
+        current_source=$(findmnt -nr -o SOURCE "$BACKUP_MOUNTPOINT" || true)
+        if [ "$current_source" != "$NFS_REMOTE" ]; then
+            fatal "Mount point %s is already in use by %s (expected %s)." "$BACKUP_MOUNTPOINT" "$current_source" "$NFS_REMOTE"
         fi
-        log_info "SMB share mounted."
+        log_info "NFS share already mounted at %s" "$BACKUP_MOUNTPOINT"
+    else
+        log_info "Mounting NFS share %s at %s..." "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"
+        if ! sudo mount -t nfs "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"; then
+            fatal "Failed to mount NFS share %s at %s." "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"
+        fi
+        log_info "NFS share mounted."
     fi
 
     # Create backup root directory.
-    BACKUP_ROOT="${SMB_MOUNTPOINT}/${BACKUP_SUBDIR}"
+    if [ -n "$BACKUP_SUBDIR" ]; then
+        BACKUP_ROOT="${BACKUP_MOUNTPOINT}/${BACKUP_SUBDIR}"
+    else
+        BACKUP_ROOT="$BACKUP_MOUNTPOINT"
+    fi
+
     mkdir -p "$BACKUP_ROOT"
     if [ ! -d "$BACKUP_ROOT" ]; then
-        fatal "Backup root directory '$BACKUP_ROOT' does not exist and could not be created."
+        fatal "Backup root directory '%s' does not exist and could not be created." "$BACKUP_ROOT"
     fi
 }
 
@@ -672,7 +680,7 @@ main() {
     if [ "$BACKUP_MODE" = "wifi" ]; then
         warn_wifi_caveats
     fi
-    ensure_smb_mount
+    ensure_nfs_mount
 
     if [ "$BACKUP_MODE" = "wifi" ]; then
         prompt_vita_wifi_endpoint
