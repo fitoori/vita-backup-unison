@@ -35,6 +35,7 @@ VITA_MOUNTED=0
 BACKUP_MODE=""
 VITA_WIFI_HOST=""
 WIFI_WARNING_SHOWN=0
+EXIT_TRAP_INSTALLED=0
 
 #######################################
 # Logging helpers
@@ -71,6 +72,37 @@ log_error() {
 fatal() {
     log_error "$@"
     exit 1
+}
+
+#######################################
+# Cleanup
+#######################################
+
+cleanup_on_exit() {
+    # Preserve the original exit status from the caller.
+    local status
+    status="$1"
+
+    # Prevent recursive trap invocation if we call exit below.
+    trap - EXIT INT TERM
+
+    # Avoid exiting early because of set -e semantics inside the cleanup path.
+    set +e
+
+    if [ "$VITA_MOUNTED" -eq 1 ] && command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$VITA_MOUNTPOINT"; then
+        log_warn "Cleaning up: attempting to unmount Vita storage mounted at %s..." "$VITA_MOUNTPOINT"
+        if umount "$VITA_MOUNTPOINT"; then
+            log_info "Cleanup succeeded: unmounted %s." "$VITA_MOUNTPOINT"
+            VITA_MOUNTED=0
+        else
+            log_warn "Cleanup could not unmount %s; manual intervention may be required." "$VITA_MOUNTPOINT"
+        fi
+    fi
+
+    # Restore error handling defaults for any subsequent commands (defensive; script is exiting).
+    set -e
+
+    exit "$status"
 }
 
 #######################################
@@ -584,6 +616,11 @@ eject_vita() {
 #######################################
 
 main() {
+    if [ "$EXIT_TRAP_INSTALLED" -eq 0 ]; then
+        trap 'cleanup_on_exit "$?"' EXIT INT TERM
+        EXIT_TRAP_INSTALLED=1
+    fi
+
     parse_args "$@"
     check_prereqs
 
