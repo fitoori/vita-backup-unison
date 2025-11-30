@@ -30,6 +30,7 @@ TMUX_SESSION_PREFIX="psvita_backup"
 # Globals
 #######################################
 
+SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 VITA_DEVICE=""
 VITA_MOUNTED=0
 BACKUP_MODE=""
@@ -251,7 +252,7 @@ maybe_reexec_in_tmux() {
             session_name="${TMUX_SESSION_PREFIX}_$(date +%Y%m%d_%H%M%S)"
             log_info "Launching tmux session '%s'..." "$session_name"
             # PSVITA_TMUX_CHILD=1 marks the child instance so we do not re-enter tmux.
-            PSVITA_TMUX_CHILD=1 exec tmux new-session -s "$session_name" "$0" "$@"
+            PSVITA_TMUX_CHILD=1 exec tmux new-session -s "$session_name" "$SCRIPT_PATH" "$@"
             ;;
         *)
             log_warn "Proceeding without tmux. If this terminal closes, the backup will abort."
