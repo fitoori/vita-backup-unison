@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+#######################################
+# Configuration
+#######################################
+
+# SMB share that holds the backup tree: smb://home.local/psvita_backup
+SMB_SERVER="home.local"
+SMB_SHARE="psvita_backup"
+SMB_MOUNTPOINT="/mnt/psvita_backup"
+
+# Subdirectory inside the mounted SMB share used as the Vita backup root.
+BACKUP_SUBDIR="vita"
+
+# Local mount point for the Vita USB mass storage.
+VITA_MOUNTPOINT="/mnt/psvita_vita"
+
+# Default tmux session name (used if we spawn one automatically).
+TMUX_SESSION_PREFIX="psvita_backup"
+
+#######################################
+# Globals
+#######################################
+
+VITA_DEVICE=""
+VITA_MOUNTED=0
+
+#######################################
+# Logging helpers
+#######################################
+
+log() {
+    # $1: level, $2...: printf-style format string and args
+    local level fmt
+    level="$1"
+    shift
+    if [ "$#" -eq 0 ]; then
+        return 0
+    fi
+    fmt="$1"
+    shift
+    printf '%s [%s] ' "$(date +%Y-%m-%dT%H:%M:%S)" "$level" >&2
+    # Format string is controlled by this script.
+    printf "$fmt" "$@" >&2
+    printf '\n' >&2
+}
+
+log_info() {
+    log "INFO" "$@"
+}
+
+log_warn() {
+    log "WARN" "$@"
+}
+
+log_error() {
+    log "ERROR" "$@"
+}
+
+fatal() {
+    log_error "$@"
+    exit 1
+}
+
+#######################################
+# Prerequisite checks
+#######################################
+
+require_cmd() {
+    local cmd
+    cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        fatal "Required command '$cmd' not found in PATH."
+    fi
+}
+
+check_prereqs() {
+    # Hard requirements for this script.
+    require_cmd lsblk
+    require_cmd mount
+    require_cmd umount
+    require_cmd mountpoint
+    require_cmd find
+    require_cmd du
+    require_cmd df
+    require_cmd unison
+    require_cmd awk
+    require_cmd sort
+    require_cmd date
+}
+
+#######################################
+# tmux handling (Step 4c)
+#######################################
+
+maybe_reexec_in_tmux() {
+    # If PSVITA_TMUX_CHILD is set, we are already running inside the tmux-managed instance.
+    if [ "${PSVITA_TMUX_CHILD:-0}" -eq 1 ]; then
+        return 0
+    fi
+
+    # If already in tmux, do nothing.
+    if [ -n "${TMUX:-}" ]; then
+        log_info "Already running inside tmux session."
+        return 0
+    fi
+
+    # If tmux is not available, warn and continue.
+    if ! command -v tmux >/dev/null 2>&1; then
+        log_warn "tmux is not installed; proceeding without tmux protection."
+        return 0
+    fi
+
+    log_info "It is strongly recommended to run this backup inside tmux."
+    printf 'Start a dedicated tmux session for this backup now? [Y/n]: '
+    read -r answer || answer="n"
+    answer=${answer:-Y}
+
+    case "$answer" in
+        [Yy]*)
+            local session_name
+            session_name="${TMUX_SESSION_PREFIX}_$(date +%Y%m%d_%H%M%S)"
+            log_info "Launching tmux session '%s'..." "$session_name"
+            # PSVITA_TMUX_CHILD=1 marks the child instance so we do not re-enter tmux.
+            PSVITA_TMUX_CHILD=1 exec tmux new-session -s "$session_name" "$0" "$@"
+            ;;
+        *)
+            log_warn "Proceeding without tmux. If this terminal closes, the backup will abort."
+            ;;
+    esac
+}
+
+#######################################
+# SMB mount handling (Step 0)
+#######################################
+
+ensure_smb_mount() {
+    if [ -z "$SMB_SERVER" ] || [ -z "$SMB_SHARE" ] || [ -z "$SMB_MOUNTPOINT" ]; then
+        fatal "SMB configuration variables must not be empty."
+    fi
+
+    mkdir -p "$SMB_MOUNTPOINT"
+
+    if mountpoint -q "$SMB_MOUNTPOINT"; then
+        log_info "SMB share already mounted at %s" "$SMB_MOUNTPOINT"
+    else
+        log_info "Mounting SMB share //%s/%s at %s..." "$SMB_SERVER" "$SMB_SHARE" "$SMB_MOUNTPOINT"
+        # Use guest access by default; adjust if your share requires credentials.
+        # You can change options here if needed (no placeholders in default config).
+        local opts
+        opts="guest,vers=3.0,uid=$(id -u),gid=$(id -g),file_mode=0644,dir_mode=0755"
+        if ! mount -t cifs "//${SMB_SERVER}/${SMB_SHARE}" "$SMB_MOUNTPOINT" -o "$opts"; then
+            fatal "Failed to mount SMB share //${SMB_SERVER}/${SMB_SHARE} at ${SMB_MOUNTPOINT}."
+        fi
+        log_info "SMB share mounted."
+    fi
+
+    # Create backup root directory.
+    BACKUP_ROOT="${SMB_MOUNTPOINT}/${BACKUP_SUBDIR}"
+    mkdir -p "$BACKUP_ROOT"
+    if [ ! -d "$BACKUP_ROOT" ]; then
+        fatal "Backup root directory '$BACKUP_ROOT' does not exist and could not be created."
+    fi
+}
+
+#######################################
+# Vita USB detection and mount
+#######################################
+
+list_usb_partitions() {
+    # List existing USB partitions (removable=1, transport=usb).
+    # Returns device paths like /dev/sdX1, one per line.
+    lsblk -nrpo NAME,TYPE,RM,TRAN 2>/dev/null | awk '$2 == "part" && $3 == "1" && $4 == "usb" { print $1 }' || true
+}
+
+select_vita_device() {
+    # Baseline list of USB partitions before VitaShell USB is enabled.
+    local -a baseline current new
+    mapfile -t baseline < <(list_usb_partitions)
+
+    log_info "Baseline USB partitions: %s" "${baseline[*]:-(none)}"
+    log_info "Step 1: On your PS Vita, launch VitaShell and enable USB mode."
+    printf 'Press ENTER once VitaShell USB mode is active and the Vita is connected via USB... '
+    read -r _
+
+    log_info "Step 2: Waiting for new USB storage (PS Vita) to appear..."
+    while :; do
+        sleep 2
+        mapfile -t current < <(list_usb_partitions)
+        new=()
+        local dev bdev found
+        for dev in "${current[@]}"; do
+            found=0
+            for bdev in "${baseline[@]}"; do
+                if [ "$dev" = "$bdev" ]; then
+                    found=1
+                    break
+                fi
+            done
+            if [ "$found" -eq 0 ]; then
+                new+=("$dev")
+            fi
+        done
+
+        if [ "${#new[@]}" -gt 0 ]; then
+            break
+        fi
+    done
+
+    log_info "Detected new USB partition(s):"
+    local idx=1
+    local dev
+    for dev in "${new[@]}"; do
+        # Show size and filesystem for each candidate.
+        local size fstype
+        size=$(lsblk -nrpo SIZE "$dev" 2>/dev/null | head -n1 || printf 'unknown')
+        fstype=$(lsblk -nrpo FSTYPE "$dev" 2>/dev/null | head -n1 || printf 'unknown')
+        printf '  [%d] %s (size=%s, fstype=%s)\n' "$idx" "$dev" "$size" "$fstype"
+        idx=$((idx + 1))
+    done
+
+    if [ "${#new[@]}" -eq 1 ]; then
+        VITA_DEVICE="${new[0]}"
+        log_info "Using detected device %s as Vita USB storage." "$VITA_DEVICE"
+    else
+        local choice
+        while :; do
+            printf 'Select the Vita device by number (1-%d): ' "${#new[@]}"
+            read -r choice
+            if [ -z "$choice" ]; then
+                log_error "No selection made."
+                continue
+            fi
+            if ! printf '%s\n' "$choice" | grep -Eq '^[0-9]+$'; then
+                log_error "Invalid selection '%s'; please enter a number." "$choice"
+                continue
+            fi
+            if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#new[@]}" ]; then
+                log_error "Selection out of range."
+                continue
+            fi
+            VITA_DEVICE="${new[$((choice - 1))]}"
+            break
+        done
+        log_info "Using selected device %s as Vita USB storage." "$VITA_DEVICE"
+    fi
+
+    if [ -z "$VITA_DEVICE" ]; then
+        fatal "No Vita device selected."
+    fi
+
+    # Check if device is already mounted (desktop automount, etc.).
+    if findmnt -nr -S "$VITA_DEVICE" >/dev/null 2>&1; then
+        log_error "Device %s is already mounted by another process. Please unmount it and re-run." "$VITA_DEVICE"
+        fatal "Refusing to remount already-mounted device."
+    fi
+}
+
+mount_vita_device() {
+    mkdir -p "$VITA_MOUNTPOINT"
+    if mountpoint -q "$VITA_MOUNTPOINT"; then
+        fatal "Mount point '%s' is already in use." "$VITA_MOUNTPOINT"
+    fi
+
+    log_info "Step 3: Mounting Vita USB storage %s at %s..." "$VITA_DEVICE" "$VITA_MOUNTPOINT"
+    # Let the kernel auto-detect filesystem; supply sensible default ownership.
+    if ! mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$VITA_DEVICE" "$VITA_MOUNTPOINT"; then
+        fatal "Failed to mount Vita device $VITA_DEVICE at $VITA_MOUNTPOINT."
+    fi
+    VITA_MOUNTED=1
+    log_info "Vita storage mounted."
+}
+
+#######################################
+# macOS artifact cleanup
+#######################################
+
+clean_macos_cruft() {
+    local root
+    root="$1"
+
+    if [ ! -d "$root" ]; then
+        fatal "Path '%s' is not a directory; cannot clean macOS artifacts." "$root"
+    fi
+
+    log_info "Cleaning macOS filesystem artifacts under %s..." "$root"
+
+    # Remove known macOS files and directories; ignore errors but warn if find fails.
+    if ! find "$root" \
+        \( -name '.DS_Store' \
+        -o -name '.Spotlight-V100' \
+        -o -name '.Trashes' \
+        -o -name '.fseventsd' \
+        -o -name '.TemporaryItems' \
+        -o -name '.VolumeIcon.icns' \
+        -o -name '.AppleDouble' \
+        -o -name '.AppleDesktop' \
+        -o -name '._*' \) \
+        -print -exec rm -rf -- {} + 2>/dev/null
+    then
+        log_warn "Some macOS artifacts may not have been removed under %s." "$root"
+    fi
+
+    log_info "macOS artifact cleanup complete for %s." "$root"
+}
+
+#######################################
+# Comparison & confirmation
+#######################################
+
+summarize_root() {
+    local label path
+    label="$1"
+    path="$2"
+
+    if [ ! -d "$path" ]; then
+        fatal "Root '%s' (%s) does not exist or is not a directory." "$label" "$path"
+    fi
+
+    local used_bytes used_hr
+    used_bytes=$(du -sb "$path" 2>/dev/null | awk '{print $1}' || printf '0')
+    used_hr=$(du -sh "$path" 2>/dev/null | awk '{print $1}' || printf '0')
+
+    printf '%s: %s (used: %s bytes, ~%s)\n' "$label" "$path" "$used_bytes" "$used_hr"
+}
+
+confirm_backup() {
+    log_info "Step 4b: Summarizing Vita and backup roots before synchronization."
+
+    summarize_root "Vita root" "$VITA_MOUNTPOINT"
+    summarize_root "Backup root" "$BACKUP_ROOT"
+
+    # Check available space on backup filesystem.
+    local avail_bytes avail_hr
+    avail_bytes=$(df -B1 "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || printf '0')
+    avail_hr=$(df -h "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || printf '0')
+
+    log_info "Backup filesystem free space at %s: %s bytes (~%s available)." "$BACKUP_ROOT" "$avail_bytes" "$avail_hr"
+
+    printf 'Proceed with Unison synchronization from Vita to backup root? [y/N]: '
+    local answer
+    read -r answer || answer="n"
+    case "$answer" in
+        [Yy]*)
+            log_info "User confirmed synchronization."
+            ;;
+        *)
+            fatal "User aborted synchronization."
+            ;;
+    esac
+}
+
+#######################################
+# Unison sync
+#######################################
+
+run_unison_sync() {
+    local root_vita root_backup
+    root_vita="$VITA_MOUNTPOINT"
+    root_backup="$BACKUP_ROOT"
+
+    log_info "Step 5: Starting Unison sync."
+    log_info "  Vita root:   %s" "$root_vita"
+    log_info "  Backup root: %s" "$root_backup"
+    log_info "Unison is configured to NEVER delete files on the backup root."
+
+    # Build Unison command.
+    # -auto -batch: non-interactive; accept default actions.
+    # -confirmbigdel=false: avoid extra prompts for large deletes (we rely on -nodeletion on backup).
+    # -nodeletion <root_backup>: do not delete files on backup root. See unison(1).
+    # -fat: appropriate for FAT-like filesystems often used on Vita storage.
+    local status
+    if unison "$root_vita" "$root_backup" \
+        -auto -batch \
+        -confirmbigdel=false \
+        -nodeletion "$root_backup" \
+        -fat
+    then
+        status=0
+    else
+        status=$?
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        log_info "Unison sync completed successfully."
+    else
+        log_error "Unison sync failed with exit code %d." "$status"
+    fi
+
+    return "$status"
+}
+
+#######################################
+# Eject Vita
+#######################################
+
+eject_vita() {
+    if [ "$VITA_MOUNTED" -ne 1 ]; then
+        log_warn "Vita is not marked as mounted; nothing to eject."
+        return 0
+    fi
+
+    log_info "Step 6b: Flushing buffers and unmounting Vita storage..."
+    sync || log_warn "sync(2) reported an error; continuing with unmount."
+
+    if umount "$VITA_MOUNTPOINT"; then
+        log_info "Unmounted %s." "$VITA_MOUNTPOINT"
+        VITA_MOUNTED=0
+    else
+        log_warn "Failed to unmount %s; check for open files." "$VITA_MOUNTPOINT"
+        return 1
+    fi
+
+    # Optionally power off the USB device, if udisksctl is available.
+    if [ -n "$VITA_DEVICE" ] && command -v udisksctl >/dev/null 2>&1; then
+        if udisksctl power-off -b "$VITA_DEVICE"; then
+            log_info "Powered off device %s. It is now safe to disconnect the Vita." "$VITA_DEVICE"
+        else
+            log_warn "Could not power off device %s via udisksctl. It should still be safe after unmount, but wait for OS indication." "$VITA_DEVICE"
+        fi
+    else
+        log_info "No udisksctl power-off performed. After unmount, it is generally safe to disconnect the Vita."
+    fi
+}
+
+#######################################
+# Main flow
+#######################################
+
+main() {
+    check_prereqs
+
+    # Step 4c: ensure tmux protection as early as possible.
+    maybe_reexec_in_tmux "$@"
+
+    ensure_smb_mount
+
+    select_vita_device
+    mount_vita_device
+
+    # Step 4: clean macOS artifacts on both roots.
+    clean_macos_cruft "$VITA_MOUNTPOINT"
+    clean_macos_cruft "$BACKUP_ROOT"
+
+    confirm_backup
+
+    # Step 6: run unison, allowing retry on failure.
+    local status
+    while :; do
+        if run_unison_sync; then
+            status=0
+            break
+        fi
+
+        status=$?
+        printf 'Unison sync failed (exit code %d). Try again? [y/N]: ' "$status"
+        local answer
+        read -r answer || answer="n"
+        case "$answer" in
+            [Yy]*)
+                log_info "Retrying Unison sync..."
+                ;;
+            *)
+                log_error "User chose not to retry after failure."
+                break
+                ;;
+        esac
+    done
+
+    if [ "$status" -eq 0 ]; then
+        # Successful sync: eject Vita and tell user to disconnect.
+        if eject_vita; then
+            printf '\nBackup completed successfully.\n'
+            printf 'Step 7: You may now safely disconnect the PS Vita from USB.\n'
+        else
+            printf '\nBackup completed, but Vita could not be fully ejected.\n'
+            printf 'Step 7: Check for open files, unmount %s manually if needed, then disconnect the PS Vita.\n' "$VITA_MOUNTPOINT"
+        fi
+    else
+        printf '\nBackup did NOT complete successfully.\n'
+        printf 'Step 7: Investigate the errors above. The Vita storage remains mounted at %s.\n' "$VITA_MOUNTPOINT"
+        printf 'You can correct the issue and re-run this script to try again.\n'
+    fi
+}
+
+main "$@"
