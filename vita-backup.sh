@@ -260,11 +260,19 @@ maybe_reexec_in_tmux() {
             session_name="${TMUX_SESSION_PREFIX}_$(date +%Y%m%d_%H%M%S)"
             local tmux_status_file
             tmux_status_file="$(mktemp -t psvita_tmux_status.XXXXXX)"
-            log_info "Launching tmux session '%s'..." "$session_name"
+
+            if [ ! -x "$SCRIPT_PATH" ]; then
+                log_error "Script path %s is not executable; cannot spawn tmux session." "$SCRIPT_PATH"
+                exit 1
+            fi
+
+            log_info "Launching tmux session '%s' running %s..." "$session_name" "$SCRIPT_PATH"
             # PSVITA_TMUX_CHILD=1 marks the child instance so we do not re-enter tmux.
-            # Do not use exec so we can gracefully recover if tmux fails to start.
+            # Use SCRIPT_PATH so tmux reliably executes this script even if the parent
+            # was invoked via a wrapper (e.g., 'bash vita-backup.sh ...').
             set +e
-            PSVITA_TMUX_CHILD=1 PSVITA_TMUX_STATUS_FILE="$tmux_status_file" tmux new-session -s "$session_name" "$0" "$@"
+            PSVITA_TMUX_CHILD=1 PSVITA_TMUX_STATUS_FILE="$tmux_status_file" \
+                tmux new-session -s "$session_name" "$SCRIPT_PATH" "$@"
             local tmux_status=$?
             set -e
 
@@ -295,7 +303,6 @@ maybe_reexec_in_tmux() {
             # The parent invocation should not continue once the tmux-managed
             # child finishes. Exit cleanly to avoid running twice.
             exit 0
-            PSVITA_TMUX_CHILD=1 exec tmux new-session -s "$session_name" "$SCRIPT_PATH" "$@"
             ;;
         *)
             log_warn "Proceeding without tmux. If this terminal closes, the backup will abort."
