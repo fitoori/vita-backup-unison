@@ -286,18 +286,20 @@ ensure_nfs_mount() {
 # PSP USB detection and mount
 #######################################
 
-list_usb_partitions() {
-    # List existing USB partitions (removable=1, transport=usb).
-    # Returns device paths like /dev/sdX1, one per line.
-    lsblk -nrpo NAME,TYPE,RM,TRAN 2>/dev/null | awk '$2 == "part" && $3 == "1" && $4 == "usb" { print $1 }' || true
+list_usb_block_devices() {
+    # List existing USB block devices attached via USB. Some PSP models expose a
+    # partition (e.g., /dev/sdX1) while others present the whole disk without a
+    # partition table. Accept both.
+    lsblk -nrpo NAME,TYPE,RM,TRAN 2>/dev/null \
+        | awk '$4 == "usb" && ($2 == "part" || $2 == "disk") { print $1 }' || true
 }
 
 select_psp_device() {
-    # Baseline list of USB partitions before ARK-4 USB is enabled.
+    # Baseline list of USB block devices before ARK-4 USB is enabled.
     local -a baseline current new
-    mapfile -t baseline < <(list_usb_partitions)
+    mapfile -t baseline < <(list_usb_block_devices)
 
-    log_info "Baseline USB partitions: %s" "${baseline[*]:-(none)}"
+    log_info "Baseline USB block devices: %s" "${baseline[*]:-(none)}"
     log_info "Step 1: On your PSP running ARK-4, enable USB device mode (e.g., XMB -> USB Connection or ARK-4 Recovery)."
     printf 'Press ENTER once USB mode is active and the PSP is connected via USB... '
     read -r _
@@ -305,7 +307,7 @@ select_psp_device() {
     log_info "Step 2: Waiting for new USB storage (PSP) to appear..."
     while :; do
         sleep 2
-        mapfile -t current < <(list_usb_partitions)
+        mapfile -t current < <(list_usb_block_devices)
         new=()
         local dev bdev found
         for dev in "${current[@]}"; do
@@ -326,7 +328,7 @@ select_psp_device() {
         fi
     done
 
-    log_info "Detected new USB partition(s):"
+    log_info "Detected new USB block device(s):"
     local idx=1
     local dev
     for dev in "${new[@]}"; do
