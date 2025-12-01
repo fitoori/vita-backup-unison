@@ -132,6 +132,7 @@ check_prereqs() {
     require_cmd sort
     require_cmd date
     require_cmd sudo
+    require_cmd numfmt
 }
 
 #######################################
@@ -514,7 +515,7 @@ summarize_root() {
 
     local used_bytes used_hr
     used_bytes=$(du -sb "$path" 2>/dev/null | awk '{print $1}' || printf '0')
-    used_hr=$(du -sh "$path" 2>/dev/null | awk '{print $1}' || printf '0')
+    used_hr=$(numfmt --to=iec "$used_bytes" 2>/dev/null || printf '0')
 
     printf '%s: %s (used: %s bytes, ~%s)\n' "$label" "$path" "$used_bytes" "$used_hr"
 }
@@ -525,10 +526,10 @@ confirm_backup() {
     summarize_root "Vita root" "$VITA_MOUNTPOINT"
     summarize_root "Backup root" "$BACKUP_ROOT"
 
-    # Check available space on backup filesystem.
+    # Check available space on backup filesystem with a single df invocation.
     local avail_bytes avail_hr
     avail_bytes=$(df -B1 "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || printf '0')
-    avail_hr=$(df -h "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || printf '0')
+    avail_hr=$(numfmt --to=iec "$avail_bytes" 2>/dev/null || printf '0')
 
     log_info "Backup filesystem free space at %s: %s bytes (~%s available)." "$BACKUP_ROOT" "$avail_bytes" "$avail_hr"
 
