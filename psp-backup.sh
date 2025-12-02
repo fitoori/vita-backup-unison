@@ -151,13 +151,18 @@ ensure_cmd_with_package() {
     package="$2"
     fatal_on_fail="$3"
 
-    if command -v "$cmd" >/dev/null 2>&1; then
+    # Many helpers (e.g., mount.nfs) live in /sbin, which is often missing from
+    # non-root PATHs. Include typical sbin locations when checking.
+    local search_path
+    search_path="/sbin:/usr/sbin:$PATH"
+
+    if PATH="$search_path" command -v "$cmd" >/dev/null 2>&1; then
         return 0
     fi
 
     install_package "$package" "$cmd command" "$fatal_on_fail"
 
-    if ! command -v "$cmd" >/dev/null 2>&1 && [ "$fatal_on_fail" -eq 1 ]; then
+    if ! PATH="$search_path" command -v "$cmd" >/dev/null 2>&1 && [ "$fatal_on_fail" -eq 1 ]; then
         fatal "Required command '%s' still missing after attempted installation." "$cmd"
     fi
 }
