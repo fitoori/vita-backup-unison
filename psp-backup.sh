@@ -107,6 +107,61 @@ cleanup_on_exit() {
 # Prerequisite checks
 #######################################
 
+APT_UPDATED=0
+
+apt_update_if_needed() {
+    if [ "$APT_UPDATED" -eq 1 ]; then
+        return 0
+    fi
+
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get update -y; then
+        APT_UPDATED=1
+        return 0
+    fi
+
+    log_warn "Unable to refresh apt package index; package installation may fail."
+    return 1
+}
+
+install_package() {
+    # $1: package name, $2: human-readable description, $3: fatal_on_fail (0/1)
+    local package desc fatal_on_fail
+    package="$1"
+    desc="$2"
+    fatal_on_fail="$3"
+
+    apt_update_if_needed || true
+
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"; then
+        log_info "Installed package '%s' (%s)." "$package" "$desc"
+        return 0
+    fi
+
+    if [ "$fatal_on_fail" -eq 1 ]; then
+        fatal "Failed to install required package '%s' (%s)." "$package" "$desc"
+    else
+        log_warn "Continuing without optional package '%s' (%s); functionality may be limited." "$package" "$desc"
+    fi
+}
+
+ensure_cmd_with_package() {
+    # $1: command, $2: package providing it, $3: fatal_on_fail (0/1)
+    local cmd package fatal_on_fail
+    cmd="$1"
+    package="$2"
+    fatal_on_fail="$3"
+
+    if command -v "$cmd" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    install_package "$package" "$cmd command" "$fatal_on_fail"
+
+    if ! command -v "$cmd" >/dev/null 2>&1 && [ "$fatal_on_fail" -eq 1 ]; then
+        fatal "Required command '%s' still missing after attempted installation." "$cmd"
+    fi
+}
+
 require_cmd() {
     local cmd
     cmd="$1"
@@ -116,6 +171,11 @@ require_cmd() {
 }
 
 check_prereqs() {
+    # Ensure packages for commonly-missing tools.
+    ensure_cmd_with_package tmux tmux 0
+    ensure_cmd_with_package unison unison 1
+    ensure_cmd_with_package mount.nfs nfs-common 1
+
     # Hard requirements for this script.
     require_cmd lsblk
     require_cmd mount
@@ -243,6 +303,20 @@ maybe_reexec_in_tmux() {
     esac
 }
 
+ensure_directory_exists_with_sudo() {
+    local dir
+    dir="$1"
+
+    if mkdir -p "$dir" 2>/dev/null; then
+        return 0
+    fi
+
+    log_warn "Could not create directory %s as current user; retrying with sudo." "$dir"
+    if ! sudo mkdir -p "$dir"; then
+        fatal "Failed to create directory %s even with sudo." "$dir"
+    fi
+}
+
 #######################################
 # NFS mount handling
 #######################################
@@ -252,7 +326,7 @@ ensure_nfs_mount() {
         fatal "NFS configuration variables must not be empty."
     fi
 
-    mkdir -p "$BACKUP_MOUNTPOINT"
+    ensure_directory_exists_with_sudo "$BACKUP_MOUNTPOINT"
 
     if mountpoint -q "$BACKUP_MOUNTPOINT"; then
         local current_source
@@ -264,7 +338,11 @@ ensure_nfs_mount() {
     else
         log_info "Mounting NFS share %s at %s..." "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"
         if ! sudo mount -t nfs "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"; then
-            fatal "Failed to mount NFS share %s at %s." "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"
+            log_warn "Initial NFS mount failed; retrying after systemd daemon-reload..."
+            sudo systemctl daemon-reload >/dev/null 2>&1 || true
+            if ! sudo mount -t nfs "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"; then
+                fatal "Failed to mount NFS share %s at %s." "$NFS_REMOTE" "$BACKUP_MOUNTPOINT"
+            fi
         fi
         log_info "NFS share mounted."
     fi
@@ -276,7 +354,7 @@ ensure_nfs_mount() {
         BACKUP_ROOT="$BACKUP_MOUNTPOINT"
     fi
 
-    mkdir -p "$BACKUP_ROOT"
+    ensure_directory_exists_with_sudo "$BACKUP_ROOT"
     if [ ! -d "$BACKUP_ROOT" ]; then
         fatal "Backup root directory '%s' does not exist and could not be created." "$BACKUP_ROOT"
     fi
@@ -378,7 +456,7 @@ select_psp_device() {
 }
 
 mount_psp_device() {
-    mkdir -p "$PSP_MOUNTPOINT"
+    ensure_directory_exists_with_sudo "$PSP_MOUNTPOINT"
     if mountpoint -q "$PSP_MOUNTPOINT"; then
         fatal "Mount point '%s' is already in use." "$PSP_MOUNTPOINT"
     fi
