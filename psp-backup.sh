@@ -115,6 +115,40 @@ require_cmd() {
     fi
 }
 
+install_unison_stack() {
+    local installer_url installer_download_url downloader
+    installer_url="https://github.com/fitoori/unison-installer/install_unison_stack.sh"
+    installer_download_url="https://raw.githubusercontent.com/fitoori/unison-installer/main/install_unison_stack.sh"
+
+    if command -v curl >/dev/null 2>&1; then
+        downloader=(curl -fsSL)
+    elif command -v wget >/dev/null 2>&1; then
+        downloader=(wget -qO-)
+    else
+        fatal "Neither curl nor wget is available to download Unison installer from %s." "$installer_url"
+    fi
+
+    log_warn "Unison not found; attempting installation via %s." "$installer_url"
+
+    if "${downloader[@]}" "$installer_download_url" | bash; then
+        log_info "Unison installer completed successfully."
+    else
+        fatal "Automatic Unison installation via %s failed." "$installer_url"
+    fi
+}
+
+ensure_unison_available() {
+    if command -v unison >/dev/null 2>&1; then
+        return 0
+    fi
+
+    install_unison_stack
+
+    if ! command -v unison >/dev/null 2>&1; then
+        fatal "Unison remains unavailable after attempting automatic installation."
+    fi
+}
+
 check_prereqs() {
     # Hard requirements for this script.
     require_cmd lsblk
@@ -125,12 +159,13 @@ check_prereqs() {
     require_cmd find
     require_cmd du
     require_cmd df
-    require_cmd unison
     require_cmd awk
     require_cmd sort
     require_cmd date
     require_cmd sudo
     require_cmd numfmt
+
+    ensure_unison_available
 }
 
 #######################################
