@@ -177,6 +177,29 @@ check_prereqs() {
     ensure_unison_available
 }
 
+ensure_nfs_common_installed() {
+    if dpkg -s nfs-common >/dev/null 2>&1; then
+        log_info "nfs-common already installed."
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        fatal "nfs-common is required but apt-get is unavailable; please install nfs-common manually."
+    fi
+
+    log_info "nfs-common not detected; attempting installation via apt."
+
+    if ! sudo apt-get update; then
+        fatal "Failed to update package lists while installing nfs-common."
+    fi
+
+    if ! sudo apt-get install -y nfs-common; then
+        fatal "Failed to install nfs-common automatically; please install it manually."
+    fi
+
+    log_info "nfs-common installed successfully."
+}
+
 #######################################
 # Argument parsing
 #######################################
@@ -715,6 +738,8 @@ main() {
 
     parse_args "$@"
     check_prereqs
+
+    ensure_nfs_common_installed
 
     # Step 4c: ensure tmux protection as early as possible.
     maybe_reexec_in_tmux "$@"
