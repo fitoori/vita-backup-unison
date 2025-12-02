@@ -378,15 +378,32 @@ select_psp_device() {
 }
 
 mount_psp_device() {
-    mkdir -p "$PSP_MOUNTPOINT"
+    if ! mkdir -p "$PSP_MOUNTPOINT"; then
+        fatal "Unable to create PSP mount point %s." "$PSP_MOUNTPOINT"
+    fi
     if mountpoint -q "$PSP_MOUNTPOINT"; then
         fatal "Mount point '%s' is already in use." "$PSP_MOUNTPOINT"
     fi
 
-    log_info "Step 3: Mounting PSP USB storage %s at %s..." "$PSP_DEVICE" "$PSP_MOUNTPOINT"
-    # Let the kernel auto-detect filesystem; supply sensible default ownership.
-    if ! mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$PSP_DEVICE" "$PSP_MOUNTPOINT"; then
-        fatal "Failed to mount PSP device $PSP_DEVICE at $PSP_MOUNTPOINT."
+    local psp_block fstype opts
+    psp_block="$PSP_DEVICE"
+    if [ -b "${PSP_DEVICE}1" ]; then
+        psp_block="${PSP_DEVICE}1"
+    fi
+
+    fstype=$(lsblk -no FSTYPE "$psp_block" 2>/dev/null || printf '')
+    fstype=${fstype:-vfat}
+
+    opts="rw,noatime"
+    case "$fstype" in
+        vfat|exfat)
+            opts+=",uid=$(id -u),gid=$(id -g),umask=0002"
+            ;;
+    esac
+
+    log_info "Step 3: Mounting PSP USB storage %s at %s..." "$psp_block" "$PSP_MOUNTPOINT"
+    if ! mount -t "$fstype" -o "$opts" "$psp_block" "$PSP_MOUNTPOINT"; then
+        fatal "Failed to mount PSP device %s at %s (fstype=%s, opts=%s)." "$psp_block" "$PSP_MOUNTPOINT" "$fstype" "$opts"
     fi
     PSP_MOUNTED=1
     log_info "PSP storage mounted."
