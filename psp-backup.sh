@@ -144,6 +144,19 @@ install_package() {
     fi
 }
 
+command_in_sbin() {
+    local cmd candidate
+    cmd="$1"
+
+    for candidate in "/sbin/$cmd" "/usr/sbin/$cmd"; do
+        if [ -x "$candidate" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 ensure_cmd_with_package() {
     # $1: command, $2: package providing it, $3: fatal_on_fail (0/1)
     local cmd package fatal_on_fail
@@ -156,13 +169,13 @@ ensure_cmd_with_package() {
     local search_path
     search_path="/sbin:/usr/sbin:$PATH"
 
-    if PATH="$search_path" command -v "$cmd" >/dev/null 2>&1; then
+    if PATH="$search_path" command -v "$cmd" >/dev/null 2>&1 || command_in_sbin "$cmd"; then
         return 0
     fi
 
     install_package "$package" "$cmd command" "$fatal_on_fail"
 
-    if ! PATH="$search_path" command -v "$cmd" >/dev/null 2>&1 && [ "$fatal_on_fail" -eq 1 ]; then
+    if [ "$fatal_on_fail" -eq 1 ] && ! PATH="$search_path" command -v "$cmd" >/dev/null 2>&1 && ! command_in_sbin "$cmd"; then
         fatal "Required command '%s' still missing after attempted installation." "$cmd"
     fi
 }
