@@ -532,7 +532,7 @@ clean_macos_cruft() {
 
     # Ensure AppleDouble files are removed before syncing to avoid case-insensitive
     # conflicts (e.g., '._H.' vs 'H.'). Fail fast if deletion cannot be confirmed.
-    local find_tmp find_err failures failure_messages err_msg file
+    local find_tmp find_err failures err_msg file
     find_tmp=$(mktemp)
     find_err=$(mktemp)
 
@@ -542,19 +542,16 @@ clean_macos_cruft() {
     fi
 
     failures=0
-    failure_messages=()
     while IFS= read -r -d '' file; do
         if ! err_msg=$(remove_appledouble_file "$file"); then
             failures=1
-            failure_messages+=("$file: ${err_msg:-unknown error}")
+            log_error "Failed to remove AppleDouble file %s: %s" "$file" "${err_msg:-unknown error}"
         fi
     done <"$find_tmp"
 
     rm -f "$find_tmp" "$find_err"
 
     if [ "$failures" -ne 0 ]; then
-        log_error "Failed to remove one or more AppleDouble files under %s." "$root"
-        printf '%s\n' "${failure_messages[@]}" >&2
         fatal "AppleDouble cleanup failed under %s due to the errors above." "$root"
     fi
 
@@ -583,7 +580,7 @@ summarize_root() {
     used_bytes=$(du -sb "$path" 2>/dev/null | awk '{print $1}' || printf '0')
     used_hr=$(numfmt --to=iec "$used_bytes" 2>/dev/null || printf '0')
 
-    printf '%s: %s (used: %s bytes, ~%s)\n' "$label" "$path" "$used_bytes" "$used_hr"
+    log_info "%s: %s (used: %s bytes, ~%s)" "$label" "$path" "$used_bytes" "$used_hr"
 }
 
 confirm_backup() {
@@ -757,7 +754,7 @@ main() {
         fi
     else
         printf '\nBackup did NOT complete successfully.\n'
-        printf 'Step 7: Investigate the errors above. The PSP storage remains mounted at %s.\n' "$PSP_MOUNTPOINT"
+        printf 'Step 7: Investigate the errors above. The PSP storage will be unmounted during cleanup (mount point: %s).\n' "$PSP_MOUNTPOINT"
         printf 'You can correct the issue and re-run this script to try again.\n'
     fi
 }
