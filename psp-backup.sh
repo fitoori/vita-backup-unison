@@ -566,12 +566,15 @@ run_unison_sync() {
     # -nodeletion <root_backup>: do not delete files on backup root. See unison(1).
     # -fat: appropriate for FAT-like filesystems often used on PSP storage.
     local status
-    if unison "$root_psp" "$root_backup" \
-        -auto -batch \
-        -confirmbigdel=false \
-        -nodeletion "$root_backup" \
+    local -a unison_args
+    unison_args=(
+        -auto -batch
+        -confirmbigdel=false
+        -nodeletion "$root_backup"
         -fat
-    then
+    )
+
+    if unison "$root_psp" "$root_backup" "${unison_args[@]}"; then
         status=0
     else
         status=$?
@@ -641,15 +644,15 @@ main() {
     select_psp_device
     mount_psp_device
 
-    # Clean macOS artifacts on both roots.
-    clean_macos_cruft "$PSP_MOUNTPOINT"
-    clean_macos_cruft "$BACKUP_ROOT"
-
     confirm_backup
 
-    # Run unison, allowing retry on failure.
+    # Run unison, allowing retry on failure. Clean macOS artifacts on both roots
+    # before each attempt to avoid AppleDouble conflicts on case-insensitive backups.
     local status
     while :; do
+        clean_macos_cruft "$PSP_MOUNTPOINT"
+        clean_macos_cruft "$BACKUP_ROOT"
+
         if run_unison_sync; then
             status=0
             break
