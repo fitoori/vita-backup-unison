@@ -644,7 +644,8 @@ clean_macos_cruft() {
     find_err=$(mktemp)
 
     if ! find "$root" -name '._*' -print0 >"$find_tmp" 2>"$find_err"; then
-        log_warn "Encountered issues scanning for AppleDouble files under %s: %s" "$root" "$(tr '\n' ' ' <"$find_err")"
+        log_error "Encountered issues scanning for AppleDouble files under %s: %s" "$root" "$(tr '\n' ' ' <"$find_err")"
+        fatal "Aborting AppleDouble cleanup for %s because the scan failed." "$root"
     fi
 
     failures=0
