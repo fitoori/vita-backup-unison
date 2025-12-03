@@ -583,7 +583,7 @@ mount_vita_wifi_share() {
 #######################################
 
 clean_macos_cruft() {
-    local root
+    local root leftover
     root="$1"
 
     if [ ! -d "$root" ]; then
@@ -601,11 +601,21 @@ clean_macos_cruft() {
         -o -name '.TemporaryItems' \
         -o -name '.VolumeIcon.icns' \
         -o -iname '.AppleDouble' \
-        -o -iname '.AppleDesktop' \
-        -o -name '._*' \) \
+        -o -iname '.AppleDesktop' \) \
         -print -exec rm -rf -- {} + 2>/dev/null
     then
         log_warn "Some macOS artifacts may not have been removed under %s." "$root"
+    fi
+
+    # Ensure AppleDouble files are removed before syncing to avoid case-insensitive
+    # conflicts (e.g., '._H.' vs 'H.'). Fail fast if deletion cannot be confirmed.
+    if ! find "$root" -name '._*' -print -delete 2>/dev/null; then
+        fatal "Failed to remove AppleDouble files under %s; cannot proceed with sync." "$root"
+    fi
+
+    leftover=$(find "$root" -name '._*' -print -quit 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+        fatal "AppleDouble files remain under %s after cleanup (e.g., %s). Please remove them and retry." "$root" "$leftover"
     fi
 
     log_info "macOS artifact cleanup complete for %s." "$root"
@@ -770,7 +780,8 @@ main() {
     # Step 6: run unison, allowing retry on failure. Clean macOS artifacts on both
     # roots before each attempt to avoid AppleDouble conflicts on case-insensitive
     # backups.
-    local status attempt
+    local status attempt run_status
+    status=1
     attempt=0
     while :; do
         if [ "$attempt" -eq 0 ]; then
@@ -781,12 +792,14 @@ main() {
         clean_macos_cruft "$VITA_MOUNTPOINT"
         clean_macos_cruft "$BACKUP_ROOT"
 
+        run_status=0
         if run_unison_sync; then
             status=0
             break
         fi
 
-        status=$?
+        run_status=$?
+        status=$run_status
         printf 'Unison sync failed (exit code %d). Try again? [y/N]: ' "$status"
         local answer
         read -r answer || answer="n"

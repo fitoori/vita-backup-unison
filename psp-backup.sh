@@ -476,7 +476,7 @@ mount_psp_device() {
 #######################################
 
 clean_macos_cruft() {
-    local root
+    local root leftover
     root="$1"
 
     if [ ! -d "$root" ]; then
@@ -494,11 +494,21 @@ clean_macos_cruft() {
         -o -name '.TemporaryItems' \
         -o -name '.VolumeIcon.icns' \
         -o -iname '.AppleDouble' \
-        -o -iname '.AppleDesktop' \
-        -o -name '._*' \) \
+        -o -iname '.AppleDesktop' \) \
         -print -exec rm -rf -- {} + 2>/dev/null
     then
         log_warn "Some macOS artifacts may not have been removed under %s." "$root"
+    fi
+
+    # Ensure AppleDouble files are removed before syncing to avoid case-insensitive
+    # conflicts (e.g., '._H.' vs 'H.'). Fail fast if deletion cannot be confirmed.
+    if ! find "$root" -name '._*' -print -delete 2>/dev/null; then
+        fatal "Failed to remove AppleDouble files under %s; cannot proceed with sync." "$root"
+    fi
+
+    leftover=$(find "$root" -name '._*' -print -quit 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+        fatal "AppleDouble files remain under %s after cleanup (e.g., %s). Please remove them and retry." "$root" "$leftover"
     fi
 
     log_info "macOS artifact cleanup complete for %s." "$root"
