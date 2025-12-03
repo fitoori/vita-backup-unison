@@ -272,14 +272,18 @@ maybe_reexec_in_tmux() {
                 exit "$tmux_status"
             fi
 
-            local child_status
+            local child_status tmux_status_contents
             child_status="$tmux_status"
             if [ -e "$tmux_status_file" ]; then
-                if read -r child_status <"$tmux_status_file"; then
-                    log_info "tmux child exited with status %s." "$child_status"
+                if tmux_status_contents=$(cat "$tmux_status_file" 2>/dev/null); then
+                    if [ -n "$tmux_status_contents" ]; then
+                        child_status="$tmux_status_contents"
+                        log_info "tmux child exited with status %s." "$child_status"
+                    else
+                        log_warn "tmux child status file was empty; using tmux exit status %d." "$tmux_status"
+                    fi
                 else
                     log_warn "Could not read tmux child status file; using tmux exit status %d." "$tmux_status"
-                    child_status="$tmux_status"
                 fi
                 rm -f "$tmux_status_file"
             else
