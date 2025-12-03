@@ -188,6 +188,40 @@ require_cmd() {
     fi
 }
 
+install_unison_stack() {
+    local installer_url installer_download_url downloader
+    installer_url="https://github.com/fitoori/unison-installer/install_unison_stack.sh"
+    installer_download_url="https://raw.githubusercontent.com/fitoori/unison-installer/main/install_unison_stack.sh"
+
+    if command -v curl >/dev/null 2>&1; then
+        downloader=(curl -fsSL)
+    elif command -v wget >/dev/null 2>&1; then
+        downloader=(wget -qO-)
+    else
+        fatal "Neither curl nor wget is available to download Unison installer from %s." "$installer_url"
+    fi
+
+    log_warn "Unison not found; attempting installation via %s." "$installer_url"
+
+    if "${downloader[@]}" "$installer_download_url" | bash; then
+        log_info "Unison installer completed successfully."
+    else
+        fatal "Automatic Unison installation via %s failed." "$installer_url"
+    fi
+}
+
+ensure_unison_available() {
+    if command -v unison >/dev/null 2>&1; then
+        return 0
+    fi
+
+    install_unison_stack
+
+    if ! command -v unison >/dev/null 2>&1; then
+        fatal "Unison remains unavailable after attempting automatic installation."
+    fi
+}
+
 check_prereqs() {
     # Ensure packages for commonly-missing tools.
     ensure_cmd_with_package tmux tmux 0
@@ -203,12 +237,36 @@ check_prereqs() {
     require_cmd find
     require_cmd du
     require_cmd df
-    require_cmd unison
     require_cmd awk
     require_cmd sort
     require_cmd date
     require_cmd sudo
     require_cmd numfmt
+
+    ensure_unison_available
+}
+
+ensure_nfs_common_installed() {
+    if dpkg -s nfs-common >/dev/null 2>&1; then
+        log_info "nfs-common already installed."
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        fatal "nfs-common is required but apt-get is unavailable; please install nfs-common manually."
+    fi
+
+    log_info "nfs-common not detected; attempting installation via apt."
+
+    if ! sudo apt-get update; then
+        fatal "Failed to update package lists while installing nfs-common."
+    fi
+
+    if ! sudo apt-get install -y nfs-common; then
+        fatal "Failed to install nfs-common automatically; please install it manually."
+    fi
+
+    log_info "nfs-common installed successfully."
 }
 
 #######################################
@@ -292,14 +350,18 @@ maybe_reexec_in_tmux() {
                 exit "$tmux_status"
             fi
 
-            local child_status
+            local child_status tmux_status_contents
             child_status="$tmux_status"
             if [ -e "$tmux_status_file" ]; then
-                if read -r child_status <"$tmux_status_file"; then
-                    log_info "tmux child exited with status %s." "$child_status"
+                if tmux_status_contents=$(cat "$tmux_status_file" 2>/dev/null); then
+                    if [ -n "$tmux_status_contents" ]; then
+                        child_status="$tmux_status_contents"
+                        log_info "tmux child exited with status %s." "$child_status"
+                    else
+                        log_warn "tmux child status file was empty; using tmux exit status %d." "$tmux_status"
+                    fi
                 else
                     log_warn "Could not read tmux child status file; using tmux exit status %d." "$tmux_status"
-                    child_status="$tmux_status"
                 fi
                 rm -f "$tmux_status_file"
             else
@@ -475,14 +537,32 @@ select_psp_device() {
 
 mount_psp_device() {
     ensure_directory_exists_with_sudo "$PSP_MOUNTPOINT"
+    if ! mkdir -p "$PSP_MOUNTPOINT"; then
+        fatal "Unable to create PSP mount point %s." "$PSP_MOUNTPOINT"
+    fi
     if mountpoint -q "$PSP_MOUNTPOINT"; then
         fatal "Mount point '%s' is already in use." "$PSP_MOUNTPOINT"
     fi
 
-    log_info "Step 3: Mounting PSP USB storage %s at %s..." "$PSP_DEVICE" "$PSP_MOUNTPOINT"
-    # Let the kernel auto-detect filesystem; supply sensible default ownership.
-    if ! mount -o uid="$(id -u)",gid="$(id -g)",umask=000 "$PSP_DEVICE" "$PSP_MOUNTPOINT"; then
-        fatal "Failed to mount PSP device $PSP_DEVICE at $PSP_MOUNTPOINT."
+    local psp_block fstype opts
+    psp_block="$PSP_DEVICE"
+    if [ -b "${PSP_DEVICE}1" ]; then
+        psp_block="${PSP_DEVICE}1"
+    fi
+
+    fstype=$(lsblk -no FSTYPE "$psp_block" 2>/dev/null || printf '')
+    fstype=${fstype:-vfat}
+
+    opts="rw,noatime"
+    case "$fstype" in
+        vfat|exfat)
+            opts+=",uid=$(id -u),gid=$(id -g),umask=0002"
+            ;;
+    esac
+
+    log_info "Step 3: Mounting PSP USB storage %s at %s..." "$psp_block" "$PSP_MOUNTPOINT"
+    if ! mount -t "$fstype" -o "$opts" "$psp_block" "$PSP_MOUNTPOINT"; then
+        fatal "Failed to mount PSP device %s at %s (fstype=%s, opts=%s)." "$psp_block" "$PSP_MOUNTPOINT" "$fstype" "$opts"
     fi
     PSP_MOUNTED=1
     log_info "PSP storage mounted."
@@ -493,7 +573,7 @@ mount_psp_device() {
 #######################################
 
 clean_macos_cruft() {
-    local root
+    local root leftover
     root="$1"
 
     if [ ! -d "$root" ]; then
@@ -504,18 +584,77 @@ clean_macos_cruft() {
 
     # Remove known macOS files and directories; ignore errors but warn if find fails.
     if ! find "$root" \
-        \( -name '.DS_Store' \
+        \( -iname '.DS_Store' \
         -o -name '.Spotlight-V100' \
         -o -name '.Trashes' \
         -o -name '.fseventsd' \
         -o -name '.TemporaryItems' \
         -o -name '.VolumeIcon.icns' \
-        -o -name '.AppleDouble' \
-        -o -name '.AppleDesktop' \
-        -o -name '._*' \) \
+        -o -iname '.AppleDouble' \
+        -o -iname '.AppleDesktop' \) \
         -print -exec rm -rf -- {} + 2>/dev/null
     then
         log_warn "Some macOS artifacts may not have been removed under %s." "$root"
+    fi
+
+    remove_appledouble_file() {
+        local path err_file err_msg
+        path="$1"
+        err_file=$(mktemp)
+
+        if rm -f -- "$path" 2>"$err_file"; then
+            rm -f "$err_file"
+            return 0
+        fi
+
+        err_msg=$(cat "$err_file")
+        rm -f "$err_file"
+
+        if printf '%s' "$err_msg" | grep -qi 'Permission denied'; then
+            log_warn "Permission denied removing AppleDouble file %s; attempting to adjust permissions." "$path"
+            if chmod u+w "$path" 2>/dev/null || { command -v sudo >/dev/null 2>&1 && sudo chmod u+w "$path" >/dev/null 2>&1; }; then
+                err_file=$(mktemp)
+                if rm -f -- "$path" 2>"$err_file"; then
+                    rm -f "$err_file"
+                    return 0
+                fi
+                err_msg=$(cat "$err_file")
+                rm -f "$err_file"
+            fi
+        fi
+
+        printf '%s' "$err_msg"
+        return 1
+    }
+
+    # Ensure AppleDouble files are removed before syncing to avoid case-insensitive
+    # conflicts (e.g., '._H.' vs 'H.'). Fail fast if deletion cannot be confirmed.
+    local find_tmp find_err failures err_msg file
+    find_tmp=$(mktemp)
+    find_err=$(mktemp)
+
+    if ! find "$root" -name '._*' -print0 >"$find_tmp" 2>"$find_err"; then
+        log_error "Encountered issues scanning for AppleDouble files under %s: %s" "$root" "$(tr '\n' ' ' <"$find_err")"
+        fatal "Aborting AppleDouble cleanup for %s because the scan failed." "$root"
+    fi
+
+    failures=0
+    while IFS= read -r -d '' file; do
+        if ! err_msg=$(remove_appledouble_file "$file"); then
+            failures=1
+            log_error "Failed to remove AppleDouble file %s: %s" "$file" "${err_msg:-unknown error}"
+        fi
+    done <"$find_tmp"
+
+    rm -f "$find_tmp" "$find_err"
+
+    if [ "$failures" -ne 0 ]; then
+        fatal "AppleDouble cleanup failed under %s due to the errors above." "$root"
+    fi
+
+    leftover=$(find "$root" -name '._*' -print -quit 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+        fatal "AppleDouble files remain under %s after cleanup (e.g., %s). Please remove them and retry." "$root" "$leftover"
     fi
 
     log_info "macOS artifact cleanup complete for %s." "$root"
@@ -538,7 +677,7 @@ summarize_root() {
     used_bytes=$(du -sb "$path" 2>/dev/null | awk '{print $1}' || printf '0')
     used_hr=$(numfmt --to=iec "$used_bytes" 2>/dev/null || printf '0')
 
-    printf '%s: %s (used: %s bytes, ~%s)\n' "$label" "$path" "$used_bytes" "$used_hr"
+    log_info "%s: %s (used: %s bytes, ~%s)" "$label" "$path" "$used_bytes" "$used_hr"
 }
 
 confirm_backup() {
@@ -587,12 +726,15 @@ run_unison_sync() {
     # -nodeletion <root_backup>: do not delete files on backup root. See unison(1).
     # -fat: appropriate for FAT-like filesystems often used on PSP storage.
     local status
-    if unison "$root_psp" "$root_backup" \
-        -auto -batch \
-        -confirmbigdel=false \
-        -nodeletion "$root_backup" \
+    local -a unison_args
+    unison_args=(
+        -auto -batch
+        -confirmbigdel=false
+        -nodeletion "$root_backup"
         -fat
-    then
+    )
+
+    if unison "$root_psp" "$root_backup" "${unison_args[@]}"; then
         status=0
     else
         status=$?
@@ -653,6 +795,8 @@ main() {
     parse_args "$@"
     check_prereqs
 
+    ensure_nfs_common_installed
+
     # Ensure tmux protection as early as possible.
     maybe_reexec_in_tmux "$@"
 
@@ -660,15 +804,21 @@ main() {
     select_psp_device
     mount_psp_device
 
-    # Clean macOS artifacts on both roots.
-    clean_macos_cruft "$PSP_MOUNTPOINT"
-    clean_macos_cruft "$BACKUP_ROOT"
-
     confirm_backup
 
-    # Run unison, allowing retry on failure.
-    local status
+    # Run unison, allowing retry on failure. Clean macOS artifacts on both roots
+    # before each attempt to avoid AppleDouble conflicts on case-insensitive backups.
+    local status attempt
+    attempt=0
     while :; do
+        if [ "$attempt" -eq 0 ]; then
+            log_info "Pre-sync cleanup: removing macOS artifacts before first Unison run."
+        else
+            log_info "Refreshing macOS artifact cleanup before retry #%d." "$attempt"
+        fi
+        clean_macos_cruft "$PSP_MOUNTPOINT"
+        clean_macos_cruft "$BACKUP_ROOT"
+
         if run_unison_sync; then
             status=0
             break
@@ -681,6 +831,7 @@ main() {
         case "$answer" in
             [Yy]*)
                 log_info "Retrying Unison sync..."
+                attempt=$((attempt + 1))
                 ;;
             *)
                 log_error "User chose not to retry after failure."
@@ -700,7 +851,7 @@ main() {
         fi
     else
         printf '\nBackup did NOT complete successfully.\n'
-        printf 'Step 7: Investigate the errors above. The PSP storage remains mounted at %s.\n' "$PSP_MOUNTPOINT"
+        printf 'Step 7: Investigate the errors above. The PSP storage will be unmounted during cleanup (mount point: %s).\n' "$PSP_MOUNTPOINT"
         printf 'You can correct the issue and re-run this script to try again.\n'
     fi
 }
