@@ -590,6 +590,14 @@ clean_macos_cruft() {
         fatal "Path '%s' is not a directory; cannot clean macOS artifacts." "$root"
     fi
 
+    if [ ! -r "$root" ] || [ ! -x "$root" ]; then
+        fatal "Directory '%s' (%s) is not readable/traversable by the current user; adjust permissions and retry." "$root" "$root"
+    fi
+
+    if [ ! -w "$root" ]; then
+        fatal "Directory '%s' (%s) is not writable by the current user; adjust permissions and retry." "$root" "$root"
+    fi
+
     log_info "Cleaning macOS filesystem artifacts under %s..." "$root"
 
     # Remove known macOS files and directories; ignore errors but warn if find fails.
