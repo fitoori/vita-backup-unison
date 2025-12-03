@@ -500,10 +500,62 @@ clean_macos_cruft() {
         log_warn "Some macOS artifacts may not have been removed under %s." "$root"
     fi
 
+    remove_appledouble_file() {
+        local path err_file err_msg
+        path="$1"
+        err_file=$(mktemp)
+
+        if rm -f -- "$path" 2>"$err_file"; then
+            rm -f "$err_file"
+            return 0
+        fi
+
+        err_msg=$(cat "$err_file")
+        rm -f "$err_file"
+
+        if printf '%s' "$err_msg" | grep -qi 'Permission denied'; then
+            log_warn "Permission denied removing AppleDouble file %s; attempting to adjust permissions." "$path"
+            if chmod u+w "$path" 2>/dev/null || { command -v sudo >/dev/null 2>&1 && sudo chmod u+w "$path" >/dev/null 2>&1; }; then
+                err_file=$(mktemp)
+                if rm -f -- "$path" 2>"$err_file"; then
+                    rm -f "$err_file"
+                    return 0
+                fi
+                err_msg=$(cat "$err_file")
+                rm -f "$err_file"
+            fi
+        fi
+
+        printf '%s' "$err_msg"
+        return 1
+    }
+
     # Ensure AppleDouble files are removed before syncing to avoid case-insensitive
     # conflicts (e.g., '._H.' vs 'H.'). Fail fast if deletion cannot be confirmed.
-    if ! find "$root" -name '._*' -print -delete 2>/dev/null; then
-        fatal "Failed to remove AppleDouble files under %s; cannot proceed with sync." "$root"
+    local find_tmp find_err failures failure_messages err_msg file
+    find_tmp=$(mktemp)
+    find_err=$(mktemp)
+
+    if ! find "$root" -name '._*' -print0 >"$find_tmp" 2>"$find_err"; then
+        log_error "Encountered issues scanning for AppleDouble files under %s: %s" "$root" "$(tr '\n' ' ' <"$find_err")"
+        fatal "Aborting AppleDouble cleanup for %s because the scan failed." "$root"
+    fi
+
+    failures=0
+    failure_messages=()
+    while IFS= read -r -d '' file; do
+        if ! err_msg=$(remove_appledouble_file "$file"); then
+            failures=1
+            failure_messages+=("$file: ${err_msg:-unknown error}")
+        fi
+    done <"$find_tmp"
+
+    rm -f "$find_tmp" "$find_err"
+
+    if [ "$failures" -ne 0 ]; then
+        log_error "Failed to remove one or more AppleDouble files under %s." "$root"
+        printf '%s\n' "${failure_messages[@]}" >&2
+        fatal "AppleDouble cleanup failed under %s due to the errors above." "$root"
     fi
 
     leftover=$(find "$root" -name '._*' -print -quit 2>/dev/null || true)
