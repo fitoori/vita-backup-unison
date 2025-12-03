@@ -483,14 +483,14 @@ clean_macos_cruft() {
 
     # Remove known macOS files and directories; ignore errors but warn if find fails.
     if ! find "$root" \
-        \( -name '.DS_Store' \
+        \( -iname '.DS_Store' \
         -o -name '.Spotlight-V100' \
         -o -name '.Trashes' \
         -o -name '.fseventsd' \
         -o -name '.TemporaryItems' \
         -o -name '.VolumeIcon.icns' \
-        -o -name '.AppleDouble' \
-        -o -name '.AppleDesktop' \
+        -o -iname '.AppleDouble' \
+        -o -iname '.AppleDesktop' \
         -o -name '._*' \) \
         -print -exec rm -rf -- {} + 2>/dev/null
     then
@@ -648,8 +648,14 @@ main() {
 
     # Run unison, allowing retry on failure. Clean macOS artifacts on both roots
     # before each attempt to avoid AppleDouble conflicts on case-insensitive backups.
-    local status
+    local status attempt
+    attempt=0
     while :; do
+        if [ "$attempt" -eq 0 ]; then
+            log_info "Pre-sync cleanup: removing macOS artifacts before first Unison run."
+        else
+            log_info "Refreshing macOS artifact cleanup before retry #%d." "$attempt"
+        fi
         clean_macos_cruft "$PSP_MOUNTPOINT"
         clean_macos_cruft "$BACKUP_ROOT"
 
@@ -665,6 +671,7 @@ main() {
         case "$answer" in
             [Yy]*)
                 log_info "Retrying Unison sync..."
+                attempt=$((attempt + 1))
                 ;;
             *)
                 log_error "User chose not to retry after failure."
